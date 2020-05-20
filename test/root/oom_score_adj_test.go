@@ -338,7 +338,7 @@ func startContainers(t *testing.T, specs []*specs.Spec, ids []string) ([]*contai
 			c()
 		}
 	}
-	localClean := specutils.MakeCleanup(cleanupAll)
+	localClean := cleanup.MakeCleanup(cleanupAll)
 	defer localClean.Clean()
 
 	// All containers must share the same root.

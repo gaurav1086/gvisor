@@ -278,7 +278,7 @@ func setup(t *testing.T) (*criutil.Crictl, func(), error) {
 			cleanups[i]()
 		}
 	}
-	cleanup := specutils.MakeCleanup(cleanupFunc)
+	cleanup := cleanup.MakeCleanup(cleanupFunc)
 	defer cleanup.Clean()
 
 	// Create temporary containerd root and state directories, and a socket

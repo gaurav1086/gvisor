@@ -27,6 +27,7 @@ import (
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -78,7 +79,7 @@ func startContainers(conf *boot.Config, specs []*specs.Spec, ids []string) ([]*C
 			c()
 		}
 	}
-	localClean := specutils.MakeCleanup(cleanupAll)
+	localClean := cleanup.Make(cleanupAll)
 	defer localClean.Clean()
 
 	for i, spec := range specs {
