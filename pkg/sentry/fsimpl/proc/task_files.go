@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/safemem"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -33,6 +34,10 @@ import (
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+// "There is an (arbitrary) limit on the number of lines in the file. As at
+// Linux 3.18, the limit is five lines." - user_namespaces(7)
+const maxIDMapLines = 5
 
 // mm gets the kernel task's MemoryManager. No additional reference is taken on
 // mm here. This is safe because MemoryManager.destroy is required to leave the
@@ -226,8 +231,9 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 		// Linux will return envp up to and including the first NULL character,
 		// so find it.
-		if end := bytes.IndexByte(buf.Bytes()[ar.Length():], 0); end != -1 {
-			buf.Truncate(end)
+		envStart := int(ar.Length())
+		if nullIdx := bytes.IndexByte(buf.Bytes()[envStart:], 0); nullIdx != -1 {
+			buf.Truncate(envStart + nullIdx)
 		}
 	}
 
@@ -282,7 +288,8 @@ func (d *commData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return nil
 }
 
-// idMapData implements vfs.DynamicBytesSource for /proc/[pid]/{gid_map|uid_map}.
+// idMapData implements vfs.WritableDynamicBytesSource for
+// /proc/[pid]/{gid_map|uid_map}.
 //
 // +stateify savable
 type idMapData struct {
@@ -294,7 +301,7 @@ type idMapData struct {
 
 var _ dynamicInode = (*idMapData)(nil)
 
-// Generate implements vfs.DynamicBytesSource.Generate.
+// Generate implements vfs.WritableDynamicBytesSource.Generate.
 func (d *idMapData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	var entries []auth.IDMapEntry
 	if d.gids {
@@ -306,6 +313,60 @@ func (d *idMapData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		fmt.Fprintf(buf, "%10d %10d %10d\n", e.FirstID, e.FirstParentID, e.Length)
 	}
 	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (d *idMapData) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+	// "In addition, the number of bytes written to the file must be less than
+	// the system page size, and the write must be performed at the start of
+	// the file ..." - user_namespaces(7)
+	srclen := src.NumBytes()
+	if srclen >= usermem.PageSize || offset != 0 {
+		return 0, syserror.EINVAL
+	}
+	b := make([]byte, srclen)
+	if _, err := src.CopyIn(ctx, b); err != nil {
+		return 0, err
+	}
+
+	// Truncate from the first NULL byte.
+	var nul int64
+	nul = int64(bytes.IndexByte(b, 0))
+	if nul == -1 {
+		nul = srclen
+	}
+	b = b[:nul]
+	// Remove the last \n.
+	if nul >= 1 && b[nul-1] == '\n' {
+		b = b[:nul-1]
+	}
+	lines := bytes.SplitN(b, []byte("\n"), maxIDMapLines+1)
+	if len(lines) > maxIDMapLines {
+		return 0, syserror.EINVAL
+	}
+
+	entries := make([]auth.IDMapEntry, len(lines))
+	for i, l := range lines {
+		var e auth.IDMapEntry
+		_, err := fmt.Sscan(string(l), &e.FirstID, &e.FirstParentID, &e.Length)
+		if err != nil {
+			return 0, syserror.EINVAL
+		}
+		entries[i] = e
+	}
+	var err error
+	if d.gids {
+		err = d.task.UserNamespace().SetGIDMap(ctx, entries)
+	} else {
+		err = d.task.UserNamespace().SetUIDMap(ctx, entries)
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	// On success, Linux's kernel/user_namespace.c:map_write() always returns
+	// count, even if fewer bytes were used.
+	return int64(srclen), nil
 }
 
 // mapsData implements vfs.DynamicBytesSource for /proc/[pid]/maps.
@@ -482,7 +543,7 @@ func (s *statusData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	var vss, rss, data uint64
 	s.task.WithMuLocked(func(t *kernel.Task) {
 		if fdTable := t.FDTable(); fdTable != nil {
-			fds = fdTable.Size()
+			fds = fdTable.CurrentMaxFDs()
 		}
 		if mm := t.MemoryManager(); mm != nil {
 			vss = mm.VirtualMemorySize()
@@ -587,6 +648,7 @@ func (o *oomScoreAdj) Write(ctx context.Context, src usermem.IOSequence, offset 
 //
 // +stateify savable
 type exeSymlink struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
@@ -605,8 +667,8 @@ func (fs *filesystem) newExeSymlink(task *kernel.Task, ino uint64) *kernfs.Dentr
 	return d
 }
 
-// Readlink implements kernfs.Inode.
-func (s *exeSymlink) Readlink(ctx context.Context) (string, error) {
+// Readlink implements kernfs.Inode.Readlink.
+func (s *exeSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return "", syserror.EACCES
 	}
@@ -616,7 +678,7 @@ func (s *exeSymlink) Readlink(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer exec.DecRef()
+	defer exec.DecRef(ctx)
 
 	return exec.PathnameWithDeleted(ctx), nil
 }
@@ -631,7 +693,7 @@ func (s *exeSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	if err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}
-	defer exec.DecRef()
+	defer exec.DecRef(ctx)
 
 	vd := exec.(*fsbridge.VFSFile).FileDescription().VirtualDentry()
 	vd.IncRef()
@@ -687,7 +749,7 @@ func (i *mountInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		// Root has been destroyed. Don't try to read mounts.
 		return nil
 	}
-	defer rootDir.DecRef()
+	defer rootDir.DecRef(ctx)
 	i.task.Kernel().VFS().GenerateProcMountInfo(ctx, rootDir, buf)
 	return nil
 }
@@ -718,7 +780,7 @@ func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		// Root has been destroyed. Don't try to read mounts.
 		return nil
 	}
-	defer rootDir.DecRef()
+	defer rootDir.DecRef(ctx)
 	i.task.Kernel().VFS().GenerateProcMounts(ctx, rootDir, buf)
 	return nil
 }
@@ -745,15 +807,15 @@ func (fs *filesystem) newNamespaceSymlink(task *kernel.Task, ino uint64, ns stri
 	return d
 }
 
-// Readlink implements Inode.
-func (s *namespaceSymlink) Readlink(ctx context.Context) (string, error) {
+// Readlink implements kernfs.Inode.Readlink.
+func (s *namespaceSymlink) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 	if err := checkTaskState(s.task); err != nil {
 		return "", err
 	}
-	return s.StaticSymlink.Readlink(ctx)
+	return s.StaticSymlink.Readlink(ctx, mnt)
 }
 
-// Getlink implements Inode.Getlink.
+// Getlink implements kernfs.Inode.Getlink.
 func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
 	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
@@ -764,17 +826,20 @@ func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.Vir
 	dentry.Init(&namespaceInode{})
 	vd := vfs.MakeVirtualDentry(mnt, dentry.VFSDentry())
 	vd.IncRef()
-	dentry.DecRef()
+	dentry.DecRef(ctx)
 	return vd, "", nil
 }
 
 // namespaceInode is a synthetic inode created to represent a namespace in
 // /proc/[pid]/ns/*.
 type namespaceInode struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+
+	locks vfs.FileLocks
 }
 
 var _ kernfs.Inode = (*namespaceInode)(nil)
@@ -787,10 +852,11 @@ func (i *namespaceInode) Init(creds *auth.Credentials, devMajor, devMinor uint32
 	i.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
 }
 
-// Open implements Inode.Open.
+// Open implements kernfs.Inode.Open.
 func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &namespaceFD{inode: i}
 	i.IncRef()
+	fd.LockFD.Init(&i.locks)
 	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
@@ -801,6 +867,7 @@ func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *
 // /proc/[pid]/ns/*.
 type namespaceFD struct {
 	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
 
 	vfsfd vfs.FileDescription
 	inode *namespaceInode
@@ -808,25 +875,30 @@ type namespaceFD struct {
 
 var _ vfs.FileDescriptionImpl = (*namespaceFD)(nil)
 
-// Stat implements FileDescriptionImpl.
+// Stat implements vfs.FileDescriptionImpl.Stat.
 func (fd *namespaceFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
-	return fd.inode.Stat(vfs, opts)
+	return fd.inode.Stat(ctx, vfs, opts)
 }
 
-// SetStat implements FileDescriptionImpl.
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *namespaceFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
 	creds := auth.CredentialsFromContext(ctx)
 	return fd.inode.SetStat(ctx, vfs, creds, opts)
 }
 
-// Release implements FileDescriptionImpl.
-func (fd *namespaceFD) Release() {
-	fd.inode.DecRef()
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *namespaceFD) Release(ctx context.Context) {
+	fd.inode.DecRef(ctx)
 }
 
-// OnClose implements FileDescriptionImpl.
-func (*namespaceFD) OnClose(context.Context) error {
-	return nil
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *namespaceFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *namespaceFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }

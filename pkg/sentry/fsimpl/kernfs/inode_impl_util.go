@@ -20,7 +20,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -40,16 +39,12 @@ func (InodeNoopRefCount) IncRef() {
 }
 
 // DecRef implements Inode.DecRef.
-func (InodeNoopRefCount) DecRef() {
+func (InodeNoopRefCount) DecRef(context.Context) {
 }
 
 // TryIncRef implements Inode.TryIncRef.
 func (InodeNoopRefCount) TryIncRef() bool {
 	return true
-}
-
-// Destroy implements Inode.Destroy.
-func (InodeNoopRefCount) Destroy() {
 }
 
 // InodeDirectoryNoNewChildren partially implements the Inode interface.
@@ -177,7 +172,7 @@ func (InodeNoDynamicLookup) Valid(ctx context.Context) bool {
 type InodeNotSymlink struct{}
 
 // Readlink implements Inode.Readlink.
-func (InodeNotSymlink) Readlink(context.Context) (string, error) {
+func (InodeNotSymlink) Readlink(context.Context, *vfs.Mount) (string, error) {
 	return "", syserror.EINVAL
 }
 
@@ -243,7 +238,7 @@ func (a *InodeAttrs) Mode() linux.FileMode {
 // Stat partially implements Inode.Stat. Note that this function doesn't provide
 // all the stat fields, and the embedder should consider extending the result
 // with filesystem-specific fields.
-func (a *InodeAttrs) Stat(*vfs.Filesystem, vfs.StatOptions) (linux.Statx, error) {
+func (a *InodeAttrs) Stat(context.Context, *vfs.Filesystem, vfs.StatOptions) (linux.Statx, error) {
 	var stat linux.Statx
 	stat.Mask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_NLINK
 	stat.DevMajor = a.devMajor
@@ -261,13 +256,30 @@ func (a *InodeAttrs) Stat(*vfs.Filesystem, vfs.StatOptions) (linux.Statx, error)
 
 // SetStat implements Inode.SetStat.
 func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
+	return a.SetInodeStat(ctx, fs, creds, opts)
+}
+
+// SetInodeStat sets the corresponding attributes from opts to InodeAttrs.
+// This function can be used by other kernfs-based filesystem implementation to
+// sets the unexported attributes into kernfs.InodeAttrs.
+func (a *InodeAttrs) SetInodeStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	if opts.Stat.Mask == 0 {
 		return nil
 	}
-	if opts.Stat.Mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID) != 0 {
+
+	// Note that not all fields are modifiable. For example, the file type and
+	// inode numbers are immutable after node creation. Setting the size is often
+	// allowed by kernfs files but does not do anything. If some other behavior is
+	// needed, the embedder should consider extending SetStat.
+	//
+	// TODO(gvisor.dev/issue/1193): Implement other stat fields like timestamps.
+	if opts.Stat.Mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID|linux.STATX_SIZE) != 0 {
 		return syserror.EPERM
 	}
-	if err := vfs.CheckSetStat(ctx, creds, &opts.Stat, a.Mode(), auth.KUID(atomic.LoadUint32(&a.uid)), auth.KGID(atomic.LoadUint32(&a.gid))); err != nil {
+	if opts.Stat.Mask&linux.STATX_SIZE != 0 && a.Mode().IsDir() {
+		return syserror.EISDIR
+	}
+	if err := vfs.CheckSetStat(ctx, creds, &opts, a.Mode(), auth.KUID(atomic.LoadUint32(&a.uid)), auth.KGID(atomic.LoadUint32(&a.gid))); err != nil {
 		return err
 	}
 
@@ -288,11 +300,6 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 	if stat.Mask&linux.STATX_GID != 0 {
 		atomic.StoreUint32(&a.gid, stat.GID)
 	}
-
-	// Note that not all fields are modifiable. For example, the file type and
-	// inode numbers are immutable after node creation.
-
-	// TODO(gvisor.dev/issue/1193): Implement other stat fields like timestamps.
 
 	return nil
 }
@@ -346,8 +353,6 @@ type OrderedChildrenOptions struct {
 //
 // Must be initialize with Init before first use.
 type OrderedChildren struct {
-	refs.AtomicRefCount
-
 	// Can children be modified by user syscalls? It set to false, interface
 	// methods that would modify the children return EPERM. Immutable.
 	writable bool
@@ -363,12 +368,9 @@ func (o *OrderedChildren) Init(opts OrderedChildrenOptions) {
 	o.set = make(map[string]*slot)
 }
 
-// DecRef implements Inode.DecRef.
-func (o *OrderedChildren) DecRef() {
-	o.AtomicRefCount.DecRefWithDestructor(o.Destroy)
-}
-
-// Destroy cleans up resources referenced by this OrderedChildren.
+// Destroy clears the children stored in o. It should be called by structs
+// embedding OrderedChildren upon destruction, i.e. when their reference count
+// reaches zero.
 func (o *OrderedChildren) Destroy() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -469,6 +471,8 @@ func (o *OrderedChildren) Unlink(ctx context.Context, name string, child *vfs.De
 	if err := o.checkExistingLocked(name, child); err != nil {
 		return err
 	}
+
+	// TODO(gvisor.dev/issue/3027): Check sticky bit before removing.
 	o.removeLocked(name)
 	return nil
 }
@@ -516,6 +520,8 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 	if err := o.checkExistingLocked(oldname, child); err != nil {
 		return nil, err
 	}
+
+	// TODO(gvisor.dev/issue/3027): Check sticky bit before removing.
 	replaced := dst.replaceChildLocked(newname, child)
 	return replaced, nil
 }
@@ -550,19 +556,24 @@ func (InodeSymlink) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.D
 //
 // +stateify savable
 type StaticDirectory struct {
-	InodeNotSymlink
-	InodeDirectoryNoNewChildren
 	InodeAttrs
+	InodeDirectoryNoNewChildren
 	InodeNoDynamicLookup
+	InodeNoStatFS
+	InodeNotSymlink
 	OrderedChildren
+	StaticDirectoryRefs
+
+	locks  vfs.FileLocks
+	fdOpts GenericDirectoryFDOptions
 }
 
 var _ Inode = (*StaticDirectory)(nil)
 
 // NewStaticDir creates a new static directory and returns its dentry.
-func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry) *Dentry {
+func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry, fdOpts GenericDirectoryFDOptions) *Dentry {
 	inode := &StaticDirectory{}
-	inode.Init(creds, devMajor, devMinor, ino, perm)
+	inode.Init(creds, devMajor, devMinor, ino, perm, fdOpts)
 
 	dentry := &Dentry{}
 	dentry.Init(inode)
@@ -575,31 +586,46 @@ func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64
 }
 
 // Init initializes StaticDirectory.
-func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
+func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, fdOpts GenericDirectoryFDOptions) {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
 	}
+	s.fdOpts = fdOpts
 	s.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeDirectory|perm)
 }
 
-// Open implements kernfs.Inode.
+// Open implements kernfs.Inode.Open.
 func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &opts)
+	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &s.locks, &opts, s.fdOpts)
 	if err != nil {
 		return nil, err
 	}
 	return fd.VFSFileDescription(), nil
 }
 
-// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*StaticDirectory) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
+}
+
+// DecRef implements kernfs.Inode.DecRef.
+func (s *StaticDirectory) DecRef(context.Context) {
+	s.StaticDirectoryRefs.DecRef(s.Destroy)
 }
 
 // AlwaysValid partially implements kernfs.inodeDynamicLookup.
 type AlwaysValid struct{}
 
-// Valid implements kernfs.inodeDynamicLookup.
+// Valid implements kernfs.inodeDynamicLookup.Valid.
 func (*AlwaysValid) Valid(context.Context) bool {
 	return true
+}
+
+// InodeNoStatFS partially implements the Inode interface, where the client
+// filesystem doesn't support statfs(2).
+type InodeNoStatFS struct{}
+
+// StatFS implements Inode.StatFS.
+func (*InodeNoStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error) {
+	return linux.Statfs{}, syserror.ENOSYS
 }

@@ -42,10 +42,11 @@ type fullFD struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
+	vfs.NoLockFD
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
-func (fd *fullFD) Release() {
+func (fd *fullFD) Release(context.Context) {
 	// noop
 }
 

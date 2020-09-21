@@ -48,6 +48,7 @@ type randomFD struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
+	vfs.NoLockFD
 
 	// off is the "file offset". off is accessed using atomic memory
 	// operations.
@@ -55,7 +56,7 @@ type randomFD struct {
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
-func (fd *randomFD) Release() {
+func (fd *randomFD) Release(context.Context) {
 	// noop
 }
 

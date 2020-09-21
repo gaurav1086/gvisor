@@ -28,6 +28,7 @@ type StaticSymlink struct {
 	InodeAttrs
 	InodeNoopRefCount
 	InodeSymlink
+	InodeNoStatFS
 
 	target string
 }
@@ -50,8 +51,8 @@ func (s *StaticSymlink) Init(creds *auth.Credentials, devMajor uint32, devMinor 
 	s.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeSymlink|0777)
 }
 
-// Readlink implements Inode.
-func (s *StaticSymlink) Readlink(_ context.Context) (string, error) {
+// Readlink implements Inode.Readlink.
+func (s *StaticSymlink) Readlink(_ context.Context, _ *vfs.Mount) (string, error) {
 	return s.target, nil
 }
 
